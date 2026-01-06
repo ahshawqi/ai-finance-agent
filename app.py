@@ -224,9 +224,10 @@ if st.button("Analyze"):
     if not os.getenv("OPENAI_API_KEY"):
         st.error("OPENAI_API_KEY is not set. Set it in your terminal/environment and restart Streamlit.")
         st.stop()
-    if not OPENAI_KEY:
+if not OPENAI_API_KEY:
     st.error("OPENAI_API_KEY is not set. Add it in Streamlit Secrets.")
     st.stop()
+
 
 
     try:
