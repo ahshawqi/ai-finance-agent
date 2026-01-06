@@ -1,271 +1,370 @@
+# app.py
 import os
-import json
 import time
-import math
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-import numpy as np
 import pandas as pd
+import numpy as np
+import streamlit as st
 import matplotlib.pyplot as plt
-import streamlit as st
-from datetime import datetime
+
 from openai import OpenAI
 
-import streamlit as st
-import os
-from openai import OpenAI
 
-OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_KEY)
+# -------------------------
+# Page config
+# -------------------------
+st.set_page_config(
+    page_title="AI Finance Agent",
+    page_icon="📈",
+    layout="wide",
+)
 
-# ----------------------------
-# OpenAI client
-# ----------------------------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+st.title("📈 AI Finance Agent")
+st.caption("Search a company → find ticker → pull 1Y price trend → show chart + metrics + AI explanation.")
 
-# ----------------------------
-# Yahoo headers (reduce 429)
-# ----------------------------
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+
+# -------------------------
+# Helpers: API key (Cloud + local)
+# -------------------------
+def get_openai_api_key() -> Optional[str]:
+    # Streamlit Cloud: st.secrets
+    if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+        key = str(st.secrets["OPENAI_API_KEY"]).strip()
+        return key if key else None
+
+    # Local dev: environment variable
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    return key if key else None
+
+
+OPENAI_API_KEY = get_openai_api_key()
+
+if not OPENAI_API_KEY:
+    st.error("OPENAI_API_KEY is not set. Add it in Streamlit Secrets (Settings → Secrets).")
+    st.stop()
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# -------------------------
+# Yahoo Finance request setup
+# -------------------------
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# ----------------------------
-# Yahoo search: company -> candidates
-# ----------------------------
-def search_company(name: str, retries: int = 3):
-    url = "https://query2.finance.yahoo.com/v1/finance/search"
-    params = {"q": name, "quotesCount": 7, "newsCount": 0}
 
+def yahoo_get(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 5) -> requests.Response:
+    """
+    GET with retry/backoff for Yahoo rate limiting (429) or transient failures.
+    """
+    last_err = None
     for attempt in range(retries):
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-        if r.status_code == 200:
-            return r.json().get("quotes", [])
-        if r.status_code == 429:
-            wait = 2 * (attempt + 1)
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
+        try:
+            r = requests.get(url, params=params, headers=YAHOO_HEADERS, timeout=20)
 
-    raise Exception("Yahoo rate limit exceeded. Try again in a minute.")
+            if r.status_code == 200:
+                return r
 
-# ----------------------------
-# OpenAI: pick best ticker
-# ----------------------------
-def analyze_company(name: str, candidates: list[dict]):
-    prompt = f"""
-User entered company name: {name}
-
-Yahoo Finance candidates (JSON):
-{json.dumps(candidates, indent=2)}
-
-Task:
-- Pick the best matching STOCK ticker symbol (prefer US equities if available).
-- Ignore ETFs/ETNs/funds unless user clearly typed an ETF name.
-- If ambiguous, ask ONE short clarifying question.
-
-If clear, output exactly:
-TICKER: <symbol>
-COMPANY: <company name>
-"""
-    resp = client.responses.create(model="gpt-4.1", input=prompt)
-    return resp.output_text
-
-def extract_ticker(ai_text: str) -> str | None:
-    for line in ai_text.splitlines():
-        if line.strip().upper().startswith("TICKER:"):
-            return line.split(":", 1)[1].strip()
-    return None
-
-# ----------------------------
-# Yahoo chart: ticker -> 1y daily closes
-# ----------------------------
-def yahoo_price_history(symbol: str, range_: str = "1y", interval: str = "1d", retries: int = 3):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": range_, "interval": interval}
-
-    for attempt in range(retries):
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-        if r.status_code == 429:
-            wait = 2 * (attempt + 1)
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        raw = r.json()
-
-        result = (raw.get("chart", {}) or {}).get("result", [])
-        if not result:
-            raise Exception(f"No chart data returned for {symbol}")
-
-        res0 = result[0]
-        timestamps = res0.get("timestamp", [])
-        quote = ((res0.get("indicators", {}) or {}).get("quote", []) or [{}])[0]
-        closes = quote.get("close", [])
-
-        rows = []
-        for ts, c in zip(timestamps, closes):
-            if c is None:
+            # 429 rate limit: wait a bit longer each time
+            if r.status_code == 429:
+                wait_s = 2 * (attempt + 1)
+                time.sleep(wait_s)
                 continue
-            dt = datetime.utcfromtimestamp(ts).date()
-            rows.append({"date": dt, "close": float(c)})
 
-        df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-        if df.empty or len(df) < 30:
-            raise Exception(f"Not enough price data for {symbol}.")
-        return df
+            # Other errors: raise
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
 
-    raise Exception("Yahoo chart rate limit exceeded. Try again shortly.")
+    raise RuntimeError(f"Yahoo request failed after {retries} tries: {last_err}")
 
-# ----------------------------
-# Metrics
-# ----------------------------
-def compute_trend_metrics(df: pd.DataFrame) -> dict:
-    d = df.copy()
-    d["ret"] = d["close"].pct_change()
-    d["ma20"] = d["close"].rolling(20).mean()
-    d["ma50"] = d["close"].rolling(50).mean()
 
-    start_price = float(d["close"].iloc[0])
-    end_price = float(d["close"].iloc[-1])
-    total_return = (end_price / start_price) - 1.0
+# -------------------------
+# Yahoo Search (company -> candidates)
+# -------------------------
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def search_company(company_name: str) -> List[Dict[str, Any]]:
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {"q": company_name, "quotesCount": 8, "newsCount": 0}
+    r = yahoo_get(url, params=params)
+    data = r.json()
+    return data.get("quotes", []) or []
 
-    vol = float(d["ret"].std() * math.sqrt(252))
 
-    running_max = d["close"].cummax()
-    drawdown = (d["close"] / running_max) - 1.0
-    max_dd = float(drawdown.min())
+# -------------------------
+# AI: pick best ticker
+# -------------------------
+def pick_ticker_with_ai(user_input: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Returns dict: { "ticker": "...", "company": "...", "reason": "..."}
+    """
+    # Keep candidate payload small & relevant
+    slim = []
+    for c in candidates[:8]:
+        slim.append({
+            "symbol": c.get("symbol"),
+            "shortname": c.get("shortname"),
+            "longname": c.get("longname"),
+            "exchDisp": c.get("exchDisp"),
+            "typeDisp": c.get("typeDisp"),
+        })
 
-    x = np.arange(len(d))
-    y = np.log(d["close"].values)
-    slope, _ = np.polyfit(x, y, 1)
-    annualized_growth = float(math.exp(slope * 252) - 1.0)
+    prompt = f"""
+You are helping match a user's company input to the most likely Yahoo Finance ticker.
 
-    ma_signal = None
-    last_ma20 = d["ma20"].iloc[-1]
-    last_ma50 = d["ma50"].iloc[-1]
-    if not np.isnan(last_ma20) and not np.isnan(last_ma50):
-        ma_signal = "bullish (MA20 > MA50)" if last_ma20 > last_ma50 else "bearish (MA20 < MA50)"
+User input: {user_input}
+
+Candidates (from Yahoo):
+{json.dumps(slim, indent=2)}
+
+Rules:
+- Pick the best match for a publicly traded company if available.
+- If user input is ambiguous, still pick the best candidate, but explain the ambiguity.
+- Output MUST be valid JSON only.
+
+Output JSON schema:
+{{
+  "ticker": "string",
+  "company": "string",
+  "reason": "string"
+}}
+"""
+
+    resp = client.responses.create(
+        model="gpt-4.1",
+        input=prompt,
+    )
+
+    text = (resp.output_text or "").strip()
+    # Defensive JSON parse
+    try:
+        return json.loads(text)
+    except Exception:
+        # fallback if model returns extra text
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+# -------------------------
+# Yahoo price history (ticker -> DataFrame)
+# -------------------------
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def yahoo_price_history(ticker: str, range_: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"range": range_, "interval": interval}
+    r = yahoo_get(url, params=params)
+    data = r.json()
+
+    chart = data.get("chart", {})
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        raise RuntimeError("Yahoo chart API returned no result.")
+
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators", {}).get("quote", [])
+    if not indicators:
+        raise RuntimeError("Yahoo chart API missing quote indicators.")
+
+    quote0 = indicators[0]
+    closes = quote0.get("close") or []
+    opens = quote0.get("open") or []
+    highs = quote0.get("high") or []
+    lows = quote0.get("low") or []
+    volumes = quote0.get("volume") or []
+
+    # Build DF
+    df = pd.DataFrame({
+        "date": pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None),
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+    })
+
+    # Clean
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+    return df
+
+
+# -------------------------
+# Trend metrics
+# -------------------------
+def compute_trend_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    close = df["close"].astype(float)
+
+    start = float(close.iloc[0])
+    end = float(close.iloc[-1])
+    n = len(close)
+
+    # Daily returns
+    ret = close.pct_change().dropna()
+    if len(ret) < 2:
+        raise RuntimeError("Not enough price points to compute returns.")
+
+    # Annualization constants
+    TRADING_DAYS = 252.0
+
+    total_return = (end / start) - 1.0
+    annualized_return = (end / start) ** (TRADING_DAYS / max(n - 1, 1)) - 1.0
+    annualized_vol = float(ret.std(ddof=1) * np.sqrt(TRADING_DAYS))
+
+    # Max drawdown
+    running_max = close.cummax()
+    drawdown = (close / running_max) - 1.0
+    max_drawdown = float(drawdown.min())
+
+    # Moving averages
+    ma20 = close.rolling(20).mean()
+    ma50 = close.rolling(50).mean()
+
+    # Simple crossover signal
+    signal = None
+    if not np.isnan(ma20.iloc[-1]) and not np.isnan(ma50.iloc[-1]):
+        signal = "bullish" if ma20.iloc[-1] > ma50.iloc[-1] else "bearish"
 
     return {
-        "points": int(len(d)),
-        "start_date": str(d["date"].iloc[0]),
-        "end_date": str(d["date"].iloc[-1]),
-        "start_price": start_price,
-        "end_price": end_price,
-        "total_return_pct": float(total_return * 100),
-        "annualized_volatility_pct": float(vol * 100),
-        "max_drawdown_pct": float(max_dd * 100),
-        "annualized_growth_estimate_pct": float(annualized_growth * 100),
-        "ma_signal": ma_signal
+        "start_price": round(start, 4),
+        "end_price": round(end, 4),
+        "days": int(n),
+        "total_return_pct": round(total_return * 100, 2),
+        "annualized_return_pct_est": round(annualized_return * 100, 2),
+        "annualized_volatility_pct": round(annualized_vol * 100, 2),
+        "max_drawdown_pct": round(max_drawdown * 100, 2),
+        "ma20_last": None if np.isnan(ma20.iloc[-1]) else round(float(ma20.iloc[-1]), 4),
+        "ma50_last": None if np.isnan(ma50.iloc[-1]) else round(float(ma50.iloc[-1]), 4),
+        "ma20_vs_ma50_signal": signal,
     }
 
-# ----------------------------
-# Chart (matplotlib) -> Streamlit
-# ----------------------------
-def make_chart(df: pd.DataFrame, symbol: str):
-    d = df.copy()
-    d["ma20"] = d["close"].rolling(20).mean()
-    d["ma50"] = d["close"].rolling(50).mean()
 
-    fig = plt.figure()
-    plt.plot(d["date"], d["close"], label="Close")
-    plt.plot(d["date"], d["ma20"], label="MA20")
-    plt.plot(d["date"], d["ma50"], label="MA50")
-    plt.title(f"{symbol} Price Trend (1y)")
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.tight_layout()
+def make_chart(df: pd.DataFrame, ticker: str):
+    fig, ax = plt.subplots()
+    ax.plot(df["date"], df["close"], label="Close")
+    ax.set_title(f"{ticker} — 1Y Price Trend")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
     return fig
 
-# ----------------------------
-# AI explanation
-# ----------------------------
-def explain_trend(symbol: str, metrics: dict):
-    prompt = f"""
-You are a helpful financial trend analyst.
 
-Given these computed metrics for {symbol} (1-year daily data):
+# -------------------------
+# AI: trend explanation
+# -------------------------
+def explain_trend(ticker: str, company: str, metrics: Dict[str, Any]) -> str:
+    prompt = f"""
+You are a finance assistant. Explain the 1-year trend using the provided metrics.
+Keep it clear and beginner-friendly. Mention risk (volatility/drawdown), trend direction, and what the MA signal implies.
+Do NOT give financial advice. End with a short disclaimer.
+
+Ticker: {ticker}
+Company: {company}
+
+Metrics:
 {json.dumps(metrics, indent=2)}
 
-Write a clear explanation for a non-expert:
-- Is it overall uptrend / downtrend / sideways? (justify using return + growth estimate + MA signal)
-- Mention total return, volatility, max drawdown in plain language
-- End with a short disclaimer: not financial advice
+Output format:
+- 1 short paragraph (4-6 sentences)
+- 3 bullet points: "Trend", "Risk", "Notes"
+- Final line: "Disclaimer: ..."
 
-Keep it concise: ~8-12 sentences.
 """
-    resp = client.responses.create(model="gpt-4.1", input=prompt)
-    return resp.output_text
+    resp = client.responses.create(
+        model="gpt-4.1",
+        input=prompt,
+    )
+    return (resp.output_text or "").strip()
 
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="AI Finance Trend Agent", layout="wide")
-st.title("AI Finance Trend Agent")
-st.write("Enter a company name. The agent validates the ticker, pulls 1-year prices, charts the trend, and explains it.")
 
-company = st.text_input("Company name", placeholder="Example: Apple, Tesla, Coca Cola, Microsoft")
+# -------------------------
+# UI
+# -------------------------
+with st.sidebar:
+    st.header("Inputs")
+    company = st.text_input("Enter company name (e.g., Coca Cola, Tesla, Google)", value="")
+    range_opt = st.selectbox("Price range", ["6mo", "1y", "2y", "5y"], index=1)
+    interval_opt = st.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    range_choice = st.selectbox("Time range", ["3mo", "6mo", "1y", "2y", "5y"], index=2)
-with col2:
-    interval_choice = st.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
+    st.divider()
+    st.caption("If Yahoo rate-limits you (429), wait 1–3 minutes and try again.")
 
-if st.button("Analyze"):
-    if not company.strip():
-        st.error("Please enter a company name.")
-        st.stop()
 
-    if not os.getenv("OPENAI_API_KEY"):
-        st.error("OPENAI_API_KEY is not set. Set it in your terminal/environment and restart Streamlit.")
-        st.stop()
-if not OPENAI_API_KEY:
-    st.error("OPENAI_API_KEY is not set. Add it in Streamlit Secrets.")
+if not company.strip():
+    st.info("Type a company name in the left sidebar to begin.")
     st.stop()
 
 
+# -------------------------
+# Run workflow
+# -------------------------
+try:
+    with st.spinner("Searching Yahoo Finance…"):
+        candidates = search_company(company.strip())
 
-    try:
-        with st.spinner("Searching Yahoo Finance..."):
-            candidates = search_company(company.strip())
+    if not candidates:
+        st.error("No Yahoo Finance matches found. Try a more specific company name.")
+        st.stop()
 
-        with st.spinner("Validating ticker with AI..."):
-            ai_validation = analyze_company(company.strip(), candidates)
-            ticker = extract_ticker(ai_validation)
+    # Show candidates
+    with st.expander("Yahoo candidates (debug)", expanded=False):
+        st.json(candidates)
 
-        st.subheader("AI Validation")
-        st.code(ai_validation)
+    with st.spinner("Validating best ticker using AI…"):
+        picked = pick_ticker_with_ai(company.strip(), candidates)
 
-        if not ticker:
-            st.warning("AI couldn't confidently pick a ticker. Try a more specific company name.")
-            st.stop()
+    ticker = (picked.get("ticker") or "").strip()
+    company_name = (picked.get("company") or company.strip()).strip()
+    reason = (picked.get("reason") or "").strip()
 
-        with st.spinner(f"Fetching price history for {ticker}..."):
-            df = yahoo_price_history(ticker, range_=range_choice, interval=interval_choice)
+    if not ticker:
+        st.error("AI could not determine a ticker. Try a more specific company name.")
+        st.stop()
 
-        with st.spinner("Computing metrics..."):
-            metrics = compute_trend_metrics(df)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("✅ Selected")
+        st.write(f"**Ticker:** {ticker}")
+        st.write(f"**Company:** {company_name}")
+    with col2:
+        st.subheader("Why this match?")
+        st.write(reason if reason else "—")
 
-        with st.spinner("Generating chart..."):
-            fig = make_chart(df, ticker)
+    with st.spinner(f"Fetching {range_opt} price history for {ticker}…"):
+        df = yahoo_price_history(ticker, range_=range_opt, interval=interval_opt)
 
+    metrics = compute_trend_metrics(df)
+
+    left, right = st.columns([1.2, 1])
+    with left:
         st.subheader("Trend Chart")
+        fig = make_chart(df, ticker)
         st.pyplot(fig)
 
+    with right:
         st.subheader("Computed Metrics")
         st.json(metrics)
 
-        with st.spinner("Writing AI trend explanation..."):
-            explanation = explain_trend(ticker, metrics)
+    with st.spinner("Writing AI trend explanation…"):
+        explanation = explain_trend(ticker, company_name, metrics)
 
-        st.subheader("AI Trend Explanation")
-        st.write(explanation)
+    st.subheader("AI Trend Explanation")
+    st.write(explanation)
 
-    except Exception as e:
-        st.error(f"Error: {e}")
-        st.info("If you see a Yahoo 429 error, wait 1–3 minutes and try again.")
+except requests.exceptions.HTTPError as e:
+    st.error(f"HTTP error: {e}")
+    st.stop()
+except Exception as e:
+    st.error(f"Error: {e}")
+    st.stop()
