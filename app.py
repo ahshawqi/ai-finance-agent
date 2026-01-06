@@ -10,6 +10,13 @@ import streamlit as st
 from datetime import datetime
 from openai import OpenAI
 
+import streamlit as st
+import os
+from openai import OpenAI
+
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY)
+
 # ----------------------------
 # OpenAI client
 # ----------------------------
@@ -217,6 +224,10 @@ if st.button("Analyze"):
     if not os.getenv("OPENAI_API_KEY"):
         st.error("OPENAI_API_KEY is not set. Set it in your terminal/environment and restart Streamlit.")
         st.stop()
+    if not OPENAI_KEY:
+    st.error("OPENAI_API_KEY is not set. Add it in Streamlit Secrets.")
+    st.stop()
+
 
     try:
         with st.spinner("Searching Yahoo Finance..."):
